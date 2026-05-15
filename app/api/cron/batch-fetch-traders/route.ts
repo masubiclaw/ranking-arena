@@ -157,9 +157,9 @@ const PLATFORM_LIMITS: Record<string, number> = {
   bybit: 50,
   bybit_spot: 50,
   // Hyperliquid: default 2000 + 3 windows + inline enrichment was hitting 240s timeout.
-  // Cap at 500 — still covers top traders by volume. HL has 33K+ traders but only top 500
-  // contribute meaningfully to ranking. Reduces fetch+write from ~200s to ~80s.
-  hyperliquid: 500,
+  // Local dev: bumped to 2000 — we have generous timeouts and want the larger pool
+  // for shrinkage statistics. Revert to 500 if Vercel maxDuration becomes a concern.
+  hyperliquid: 2000,
   // Copin API has max 1000 traders per statisticType — no point requesting 2000
   dydx: 1000,
 }

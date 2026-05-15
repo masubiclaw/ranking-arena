@@ -152,3 +152,7 @@ e2e/*debug*
 # trigger.dev (tracked — Phase 1 canary)
 # trigger.config.ts
 # lib/jobs/trigger.ts
+
+# Local dev infra (self-hosted Postgres/PostgREST stack)
+postgrest.conf
+local-supabase-proxy.mjs

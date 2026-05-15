@@ -100,14 +100,17 @@ export async function GET(request: NextRequest) {
       })
       lockAcquired = result === 'OK'
     } else {
-      // Redis unavailable: fail safe. Previously used tieredGet/tieredSet which
-      // is NOT atomic — two concurrent requests could both see !cached.data as true
-      // and both acquire the "lock", causing double-compute with data inconsistency.
-      // The next cron invocation (1h) will retry when Redis is back.
-      logger.warn(
-        '[compute-leaderboard] Redis unavailable, skipping run (fail-safe to prevent double-compute)'
-      )
-      lockAcquired = false
+      // Redis unavailable: in dev/local, proceed without lock (single process).
+      // In prod, fail safe to prevent double-compute.
+      if (process.env.NODE_ENV !== 'production') {
+        logger.warn('[compute-leaderboard] Redis unavailable in dev, proceeding without lock')
+        lockAcquired = true
+      } else {
+        logger.warn(
+          '[compute-leaderboard] Redis unavailable, skipping run (fail-safe to prevent double-compute)'
+        )
+        lockAcquired = false
+      }
     }
   } catch (err) {
     // Redis threw — fail safe instead of proceeding unprotected.
