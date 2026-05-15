@@ -3,7 +3,9 @@ import Link from 'next/link'
 import { getSupabaseAdmin } from '@/lib/api'
 import { getBtcBenchmark } from '@/lib/data/btc-returns'
 import { getSp500Returns } from '@/lib/data/sp500-returns'
-import { fetchHyperliquidPortfolio, fetchHyperliquidPortfolioHistory } from '@/lib/data/hyperliquid-portfolio'
+import { fetchHyperliquidPortfolioHistory } from '@/lib/data/hyperliquid-portfolio'
+import { fetchPortfolio, SUPPORTED_POSITION_PLATFORMS } from '@/lib/data/positions'
+import type { TraderPortfolio } from '@/lib/data/positions'
 import { aggregateExcessSharpe } from '@/lib/utils/benchmark-sharpe'
 import { TraderEquityChart } from './TraderEquityChart'
 
@@ -92,15 +94,16 @@ export default async function TraderDetailPage({
   const hasAnyData = Object.values(windowStats).some((s) => s != null)
   if (!hasAnyData) notFound()
 
-  // Hyperliquid: fetch current positions + portfolio history (only public API
-  // that's free). Other platforms — null and we fall back gracefully.
-  const isHl = platform === 'hyperliquid'
-  const [portfolio, portfolioHistory] = isHl
-    ? await Promise.all([
-        fetchHyperliquidPortfolio(decodedKey),
-        fetchHyperliquidPortfolioHistory(decodedKey),
-      ])
-    : [null, null]
+  // Live portfolio across supported platforms (Hyperliquid + GMX + dYdX so far).
+  // Hyperliquid additionally has a portfolio-history endpoint that we use for
+  // the equity curve below.
+  const positionsSupported = SUPPORTED_POSITION_PLATFORMS.has(platform)
+  const [portfolio, portfolioHistory] = await Promise.all([
+    positionsSupported ? fetchPortfolio(platform, decodedKey) : Promise.resolve(null),
+    platform === 'hyperliquid'
+      ? fetchHyperliquidPortfolioHistory(decodedKey)
+      : Promise.resolve(null),
+  ])
 
   return (
     <main style={{ padding: '24px 32px', maxWidth: 1400, margin: '0 auto', color: '#e8e8e8' }}>
@@ -113,8 +116,10 @@ export default async function TraderDetailPage({
         </h1>
         <div style={{ color: '#9aa', fontSize: 13 }}>
           {portfolio
-            ? `account value ≈ $${Math.round(portfolio.accountValueUsd).toLocaleString()} · ${portfolio.positions.length} open position${portfolio.positions.length === 1 ? '' : 's'}`
-            : 'positional data not available for this platform'}
+            ? `${portfolio.accountValueUsd != null ? `account ≈ $${Math.round(portfolio.accountValueUsd).toLocaleString()} · ` : ''}${portfolio.positions.length} open position${portfolio.positions.length === 1 ? '' : 's'} · source: ${portfolio.source}`
+            : positionsSupported
+            ? 'no open positions or trader address not found on platform'
+            : `live positions not yet wired for ${platform}`}
         </div>
       </header>
 
@@ -296,15 +301,14 @@ function ComparisonBars({
   )
 }
 
-function PortfolioBreakdown({ portfolio }: { portfolio: NonNullable<Awaited<ReturnType<typeof fetchHyperliquidPortfolio>>> }) {
-  const total = portfolio.positions.reduce((s, p) => s + Math.abs(p.positionValueUsd), 0)
-  const sorted = [...portfolio.positions].sort((a, b) => Math.abs(b.positionValueUsd) - Math.abs(a.positionValueUsd))
+function PortfolioBreakdown({ portfolio }: { portfolio: TraderPortfolio }) {
+  const total = portfolio.totalNotionalUsd
+  const sorted = [...portfolio.positions].sort((a, b) => b.notionalUsd - a.notionalUsd)
   return (
     <div>
       <div style={{ fontSize: 12, color: '#9aa', marginBottom: 10 }}>
-        Total notional: ${Math.round(total).toLocaleString()} ·
-        Margin used: ${Math.round(portfolio.totalMarginUsedUsd).toLocaleString()} ·
-        Account value: ${Math.round(portfolio.accountValueUsd).toLocaleString()}
+        Total notional: ${Math.round(total).toLocaleString()}
+        {portfolio.accountValueUsd != null && ` · Account value: $${Math.round(portfolio.accountValueUsd).toLocaleString()}`}
       </div>
       <table style={comparisonTable}>
         <thead>
@@ -321,19 +325,23 @@ function PortfolioBreakdown({ portfolio }: { portfolio: NonNullable<Awaited<Retu
         </thead>
         <tbody>
           {sorted.map((p) => {
-            const pct = total > 0 ? (Math.abs(p.positionValueUsd) / total) * 100 : 0
-            const side = p.szi > 0 ? 'LONG' : 'SHORT'
+            const pct = total > 0 ? (p.notionalUsd / total) * 100 : 0
             return (
-              <tr key={p.coin}>
-                <td style={td}><strong>{p.coin}</strong></td>
-                <td style={{ ...tdRight, color: side === 'LONG' ? '#7fd97f' : '#ff8888' }}>{side}</td>
-                <td style={tdRight}>{Math.abs(p.szi).toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
-                <td style={tdRight}>${p.entryPx.toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
-                <td style={tdRight}>${Math.round(p.positionValueUsd).toLocaleString()}</td>
+              <tr key={p.symbol}>
+                <td style={td}><strong>{p.symbol}</strong></td>
+                <td style={{ ...tdRight, color: p.side === 'long' ? '#7fd97f' : '#ff8888' }}>
+                  {p.side.toUpperCase()}
+                </td>
+                <td style={tdRight}>{p.size.toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
+                <td style={tdRight}>${p.entryPrice.toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
+                <td style={tdRight}>${Math.round(p.notionalUsd).toLocaleString()}</td>
                 <td style={tdRight}>{pct.toFixed(1)}%</td>
-                <td style={tdRight}>{p.leverage.toFixed(0)}x</td>
-                <td style={{ ...tdRight, color: p.unrealizedPnl >= 0 ? '#7fd97f' : '#ff8888' }}>
-                  ${Math.round(p.unrealizedPnl).toLocaleString()}
+                <td style={tdRight}>{p.leverage != null ? `${p.leverage.toFixed(0)}x` : '—'}</td>
+                <td style={{
+                  ...tdRight,
+                  color: p.unrealizedPnlUsd == null ? '#9aa' : p.unrealizedPnlUsd >= 0 ? '#7fd97f' : '#ff8888',
+                }}>
+                  {p.unrealizedPnlUsd == null ? '—' : `$${Math.round(p.unrealizedPnlUsd).toLocaleString()}`}
                 </td>
               </tr>
             )
