@@ -197,6 +197,54 @@ interface HyperliquidFill {
 }
 
 /**
+ * Fetch all-time fill count for a Hyperliquid trader by paginating
+ * `userFillsByTime` from epoch 0. The plain `userFills` endpoint and the
+ * 90-day `userFillsByTime` window both saturate at ~2000 fills, so traders
+ * with 500+ trades all look identical to empirical-Bayes shrinkage even though
+ * some have 10× the evidence.
+ *
+ * Pagination: each call returns at most PAGE_SIZE fills chronologically. When
+ * the batch is full we slide startTime forward to the last fill's timestamp + 1
+ * and repeat. We cap at MAX_FILLS to avoid runaway calls for market-makers.
+ *
+ * Returned value is always ≥ 0. A return of MAX_FILLS means "at least that
+ * many" — the caller should treat it as a censored observation.
+ */
+const HL_FILL_PAGE_SIZE = 2000
+const HL_MAX_FILLS = 10000
+
+export async function fetchHyperliquidAllTimeFillCount(address: string): Promise<number> {
+  let total = 0
+  let startTime = 0
+
+  while (total < HL_MAX_FILLS) {
+    let batch: HyperliquidFill[] = []
+    try {
+      const raw = await fetchJson<HyperliquidFill[]>('https://api.hyperliquid.xyz/info', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: { type: 'userFillsByTime', user: address, startTime },
+        timeoutMs: 15000,
+      })
+      batch = Array.isArray(raw) ? raw : []
+    } catch (err) {
+      logger.debug(`[enrichment-dex] HL fill count page failed for ${address}: ${err}`)
+      break
+    }
+
+    total += batch.length
+
+    if (batch.length < HL_FILL_PAGE_SIZE) break   // last page
+    // Slide forward: use last fill's time + 1ms to avoid re-fetching the same fill
+    const lastTime = batch[batch.length - 1]?.time
+    if (!lastTime) break
+    startTime = lastTime + 1
+  }
+
+  return Math.min(total, HL_MAX_FILLS)
+}
+
+/**
  * Per-trader cache for Hyperliquid fills.
  *
  * Each trader's enrichment historically fired 3 separate fetchHyperliquidFills()
@@ -534,7 +582,8 @@ export async function fetchHyperliquidEquityCurve(
  */
 export async function fetchHyperliquidStatsDetail(address: string): Promise<StatsDetail | null> {
   try {
-    // Fetch both clearinghouse state and fills in parallel (with error tolerance)
+    // Fetch clearinghouse state, recent fills (for win rate / MDD / Sharpe), and
+    // all-time fill count (for shrinkage σ²) in parallel.
     const results = await Promise.allSettled([
       fetchJson<{
         marginSummary?: { accountValue?: string; totalMarginUsed?: string }
@@ -558,10 +607,18 @@ export async function fetchHyperliquidStatsDetail(address: string): Promise<Stat
         )
         return [] as HyperliquidFill[]
       }),
+      fetchHyperliquidAllTimeFillCount(address).catch((err) => {
+        logger.warn(
+          `[enrichment-dex] Hyperliquid all-time fill count failed for ${address}:`,
+          err instanceof Error ? err.message : String(err)
+        )
+        return null as number | null
+      }),
     ])
 
     const state = results[0].status === 'fulfilled' ? results[0].value : null
-    const fills = results[1].status === 'fulfilled' ? results[1].value : []
+    const fills = results[1].status === 'fulfilled' ? (results[1].value ?? []) : []
+    const allTimeFillCount = results[2].status === 'fulfilled' ? results[2].value : null
 
     if (results[0].status === 'rejected') {
       logger.error(`Hyperliquid state fetch failed for ${address}`, {
@@ -585,12 +642,16 @@ export async function fetchHyperliquidStatsDetail(address: string): Promise<Stat
       : 0
     const openPositions = state?.assetPositions?.length || 0
 
-    // Compute trade stats from fills
+    // Compute trade stats from fills (recent window; used for win rate / MDD / Sharpe)
     const positions = parseFillsToPositions(fills, 500)
     const derivedStats = computeStatsFromPositions(positions)
 
+    // Use all-time fill count when available (true evidence count for shrinkage).
+    // Falls back to 90-day window count if the paginated fetch failed.
+    const totalTrades = allTimeFillCount ?? derivedStats.totalTrades ?? null
+
     return {
-      totalTrades: derivedStats.totalTrades ?? null,
+      totalTrades,
       profitableTradesPct: derivedStats.profitableTradesPct ?? null,
       avgHoldingTimeHours: null,
       avgProfit: derivedStats.avgProfit ?? null,
