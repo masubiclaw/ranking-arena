@@ -1120,9 +1120,33 @@ async function computeSeason(
             : 'cex_leaderboard',
         last_seen_at: new Date().toISOString(),
       }))
+      // First pass: guarantee rows exist (ignoreDuplicates=true — no overwrite)
       const { error: parentErr } = await supabase
         .from('trader_sources')
         .upsert(parentRows, { onConflict: 'source,source_trader_id', ignoreDuplicates: true })
+
+      // Second pass: update handle + avatar for rows that have real values
+      const withProfile = parentRows.filter((r) => r.handle || r.avatar_url)
+      if (withProfile.length > 0) {
+        await supabase
+          .from('trader_sources')
+          .upsert(withProfile, { onConflict: 'source,source_trader_id', ignoreDuplicates: false })
+
+        // Mirror profile updates into the traders unified table
+        const traderProfileRows = withProfile.map((r) => ({
+          platform: r.source,
+          trader_key: r.source_trader_id,
+          market_type: r.source_type || 'futures',
+          handle: r.handle,
+          avatar_url: r.avatar_url,
+          is_active: true,
+          last_seen_at: r.last_seen_at,
+          updated_at: new Date().toISOString(),
+        }))
+        await supabase
+          .from('traders')
+          .upsert(traderProfileRows, { onConflict: 'platform,trader_key', ignoreDuplicates: false })
+      }
       if (parentErr) {
         logger.warn(`[${season}] trader_sources parent-upsert non-fatal: ${parentErr.message}`)
       }
