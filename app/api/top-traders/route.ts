@@ -255,7 +255,14 @@ export async function GET(request: NextRequest) {
       }
     })
     .filter((x) => x.score != null)
-    .sort((a, b) => (b.score! - a.score!))
+    .sort((a, b) => {
+      const diff = b.score! - a.score!
+      if (Math.abs(diff) > 1e-9) return diff
+      // Secondary: arena_score breaks ties deterministically (e.g. BTCC traders
+      // with null trades_count all get the same shrunk value via medianTrades
+      // substitution; arena_score picks the stronger performer within the tie).
+      return (b.row.arena_score ?? 0) - (a.row.arena_score ?? 0)
+    })
     .slice(0, limit)
     .map((x, i) => ({
       rank: i + 1,
