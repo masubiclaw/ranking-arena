@@ -99,12 +99,20 @@
       "schedule": "5 0 * * *"
     },
     {
+      "path": "/api/cron/cache-benchmark-prices",
+      "schedule": "15 0 * * *"
+    },
+    {
       "path": "/api/cron/aggregate-daily-snapshots?days_back=3",
       "schedule": "30 2 * * *"
     },
     {
       "path": "/api/cron/compute-derived-metrics",
       "schedule": "20 0 * * *"
+    },
+    {
+      "path": "/api/cron/derive-equity-drawdown",
+      "schedule": "30 1 * * *"
     },
     {
       "path": "/api/cron/cleanup-data",
