@@ -24,6 +24,13 @@ import {
   type TraderExecutor,
   type CopyContext,
 } from '@/lib/copy-trading/executor'
+import {
+  applyGuards,
+  loadSettingsRow,
+  loadStateRow,
+  type CopySettings,
+  type CopyState,
+} from '@/lib/copy-trading/guards'
 import type { PositionChange } from '@/lib/data/positions/diff'
 
 export const dynamic = 'force-dynamic'
@@ -52,13 +59,49 @@ export async function GET(request: NextRequest) {
   )
   const leaderPlatform = params.get('leader_platform') ?? process.env.COPY_LEADER_PLATFORM_DEFAULT ?? null
 
+  const followerLabel = process.env.FOLLOWER_LABEL ?? 'local-bot'
+  const supabase = getSupabaseAdmin()
+
+  // Load runtime-tunable guards from the DB. Fall back to env if missing.
+  const [{ data: settingsRow }, { data: stateRow }] = await Promise.all([
+    supabase.from('copy_settings').select('*').eq('follower', followerLabel).maybeSingle(),
+    supabase.from('copy_state').select('*').eq('follower', followerLabel).maybeSingle(),
+  ])
+  const settings: CopySettings = settingsRow
+    ? loadSettingsRow(settingsRow as Record<string, unknown>)
+    : {
+        follower: followerLabel,
+        capitalUsd: Number(process.env.FOLLOWER_CAPITAL_USD ?? 1000),
+        maxPositionNotionalUsd: Number(process.env.COPY_MAX_NOTIONAL_USD ?? 250),
+        maxLeverage: Number(process.env.COPY_MAX_LEVERAGE ?? 3),
+        maxConcurrentPositions: 5,
+        symbolWhitelist: null,
+        symbolBlacklist: null,
+        cooldownMinutesOnLosses: 30,
+        lossStreakThreshold: 3,
+        maxLossPerTradePct: 5,
+        enabled: true,
+      }
+  const state: CopyState = stateRow
+    ? loadStateRow(stateRow as Record<string, unknown>)
+    : { follower: followerLabel, lossStreak: 0, cooldownUntil: null, lastEventAt: null }
+
   const ctx: CopyContext = {
-    followerCapitalUsd: Number(process.env.FOLLOWER_CAPITAL_USD ?? 1000),
-    maxPositionNotionalUsd: Number(process.env.COPY_MAX_NOTIONAL_USD ?? 250),
-    maxLeverage: Number(process.env.COPY_MAX_LEVERAGE ?? 3),
+    followerCapitalUsd: settings.capitalUsd,
+    maxPositionNotionalUsd: settings.maxPositionNotionalUsd,
+    maxLeverage: settings.maxLeverage,
   }
 
-  const supabase = getSupabaseAdmin()
+  // Count current open positions for the cap guard. dry_run_orders is the
+  // best proxy when we're not yet executing live.
+  const { count: openCount } = await supabase
+    .from('dry_run_orders')
+    .select('*', { count: 'exact', head: true })
+    .eq('follower', followerLabel)
+    .in('intent', ['open', 'flip', 'increase'])
+    .gte('submitted_at', new Date(Date.now() - 24 * 3600 * 1000).toISOString())
+  const openPositionCount = openCount ?? 0
+
   let query = supabase
     .from('position_changes')
     .select('*')
@@ -112,25 +155,47 @@ export async function GET(request: NextRequest) {
     return { ev, order }
   })
 
-  const executed = []
+  const executed: Array<Record<string, unknown>> = []
+  let openCountRunning = openPositionCount
   for (const { ev, order } of intents) {
     if (!order) {
       executed.push({ skipped: true, reason: 'no order from sizing', event: ev.symbol })
       continue
     }
-    const result = await executor.execute(order)
+    const guard = applyGuards(order, settings, state, { openPositionCount: openCountRunning })
+    if (!guard.ok || !guard.order) {
+      executed.push({ skipped: true, reason: guard.reason, event: `${ev.symbol} ${ev.change_type}` })
+      continue
+    }
+    const result = await executor.execute(guard.order)
     executed.push({ event: `${ev.symbol} ${ev.change_type}`, ...result })
+    if (result.ok && (guard.order.intent === 'open' || guard.order.intent === 'flip' || guard.order.intent === 'increase')) {
+      openCountRunning++
+    }
   }
 
   return NextResponse.json({
     ok: true,
     executor: executor.name,
+    follower: followerLabel,
     leader_platform: leaderPlatform,
-    follower_capital_usd: ctx.followerCapitalUsd,
-    max_notional_usd: ctx.maxPositionNotionalUsd,
-    max_leverage: ctx.maxLeverage,
+    settings: {
+      capital_usd: settings.capitalUsd,
+      max_notional_usd: settings.maxPositionNotionalUsd,
+      max_leverage: settings.maxLeverage,
+      max_concurrent_positions: settings.maxConcurrentPositions,
+      whitelist: settings.symbolWhitelist,
+      blacklist: settings.symbolBlacklist,
+      enabled: settings.enabled,
+    },
+    state: {
+      loss_streak: state.lossStreak,
+      cooldown_until: state.cooldownUntil,
+    },
+    open_positions_before: openPositionCount,
     events: events.length,
-    executed: executed.length,
+    executed: executed.filter((e) => !('skipped' in e)).length,
+    skipped: executed.filter((e) => 'skipped' in e).length,
     results: executed,
   })
 }
