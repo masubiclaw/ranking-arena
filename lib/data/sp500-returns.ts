@@ -58,7 +58,25 @@ async function fromDb(periodDays: number): Promise<Snapshot | null> {
   }
 }
 
-async function fromRemote(periodDays: number): Promise<Snapshot> {
+async function fromStooq(periodDays: number): Promise<Snapshot> {
+  const lookback = periodDays + 20
+  const d2 = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+  const d1 = new Date(Date.now() - lookback * 24 * 60 * 60 * 1000).toISOString().slice(0, 10).replace(/-/g, '')
+  const url = `https://stooq.com/q/d/l/?s=spy.us&i=d&d1=${d1}&d2=${d2}`
+  const res = await fetch(url, { headers: { accept: 'text/csv' } })
+  if (!res.ok) throw new Error(`Stooq SPY ${res.status}`)
+  const text = await res.text()
+  const closes: number[] = []
+  for (const line of text.split('\n').slice(1)) {
+    const [date, , , , close] = line.trim().split(',')
+    const c = parseFloat(close)
+    if (date && !isNaN(c) && c > 0) closes.push(c)
+  }
+  if (closes.length < 2) throw new Error(`Stooq returned ${closes.length} SPY closes`)
+  return buildSnapshot(closes, periodDays)
+}
+
+async function fromYahoo(periodDays: number): Promise<Snapshot> {
   const range = PERIOD_TO_RANGE[periodDays] ?? '3mo'
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/SPY?range=${range}&interval=1d`
   const res = await fetch(url, { headers: { accept: 'application/json', 'user-agent': 'arena-ranking/1.0' } })
@@ -70,6 +88,15 @@ async function fromRemote(periodDays: number): Promise<Snapshot> {
     .filter((v): v is number => typeof v === 'number')
   if (closes.length < 2) throw new Error('Yahoo returned <2 SPY closes')
   return buildSnapshot(closes, periodDays)
+}
+
+async function fromRemote(periodDays: number): Promise<Snapshot> {
+  try {
+    return await fromStooq(periodDays)
+  } catch (err) {
+    console.warn('[sp500-returns] Stooq failed, falling back to Yahoo:', err)
+    return fromYahoo(periodDays)
+  }
 }
 
 export async function getSp500Returns(periodDays: 7 | 30 | 90): Promise<Snapshot> {

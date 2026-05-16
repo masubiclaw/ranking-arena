@@ -58,7 +58,28 @@ async function fetchBtcRemote(days: number): Promise<Series> {
   }
 }
 
-async function fetchSpyRemote(days: number): Promise<Series> {
+async function fetchSpyStooq(days: number): Promise<Series> {
+  const d2 = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+  const d1 = new Date(Date.now() - (days + 30) * 24 * 60 * 60 * 1000).toISOString().slice(0, 10).replace(/-/g, '')
+  const url = `https://stooq.com/q/d/l/?s=spy.us&i=d&d1=${d1}&d2=${d2}`
+  const res = await fetch(url, { headers: { accept: 'text/csv' } })
+  if (!res.ok) throw new Error(`Stooq SPY ${res.status}`)
+  const text = await res.text()
+  const timestamps: number[] = []
+  const values: number[] = []
+  for (const line of text.split('\n').slice(1)) {
+    const [date, , , , close] = line.trim().split(',')
+    const c = parseFloat(close)
+    if (date && !isNaN(c) && c > 0) {
+      timestamps.push(new Date(date).getTime())
+      values.push(c)
+    }
+  }
+  if (timestamps.length < 2) throw new Error(`Stooq returned ${timestamps.length} SPY rows`)
+  return { timestamps, values }
+}
+
+async function fetchSpyYahoo(days: number): Promise<Series> {
   const range = days <= 7 ? '1mo' : days <= 30 ? '3mo' : days <= 90 ? '6mo' : '1y'
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/SPY?range=${range}&interval=1d`
   const res = await fetch(url, { headers: { accept: 'application/json', 'user-agent': 'arena-ranking/1.0' } })
@@ -75,11 +96,20 @@ async function fetchSpyRemote(days: number): Promise<Series> {
   const values: number[] = []
   for (let i = 0; i < t.length; i++) {
     if (typeof c[i] === 'number') {
-      timestamps.push(t[i] * 1000) // SPY ts in seconds; normalize to ms
+      timestamps.push(t[i] * 1000)
       values.push(c[i] as number)
     }
   }
   return { timestamps, values }
+}
+
+async function fetchSpyRemote(days: number): Promise<Series> {
+  try {
+    return await fetchSpyStooq(days)
+  } catch (err) {
+    console.warn('[btc-daily] Stooq failed, falling back to Yahoo:', err)
+    return fetchSpyYahoo(days)
+  }
 }
 
 // ---------- Public API ----------
