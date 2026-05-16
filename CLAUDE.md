@@ -282,7 +282,11 @@ STRIPE_SECRET_KEY
 ## Known Issues / Caveats
 
 1. **Geo-blocking**: Binance/OKX APIs blocked in some regions. Use cloudflare-worker proxy or VPS.
-2. **Memory**: Dev server needs `--max-old-space-size=3584` (configured in npm scripts)
+2. **Memory**: Dev server needs `--max-old-space-size=3584` (configured in npm scripts). After ~6 h of
+   uptime, `next-server` RSS can climb to ~1 GB and `.next/` build cache to ~12 GB (Turbopack
+   incremental compilation artifacts). Workaround: `npm run clean` (`rm -rf .next out`) then restart
+   the dev server. Automated agent sessions should restart the dev server every ~4 hours or run
+   `npm run clean` before starting a new session.
 3. **Build time**: Full build takes significant time; use Turbopack in dev
 4. **Concurrent push races**: Arena runs up to 7 `claude` sessions + openclaw cron
    jobs simultaneously, all pushing to main with the same git identity. The
