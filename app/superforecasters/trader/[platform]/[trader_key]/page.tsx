@@ -7,6 +7,7 @@ import { fetchHyperliquidPortfolioHistory } from '@/lib/data/hyperliquid-portfol
 import { fetchPortfolio, SUPPORTED_POSITION_PLATFORMS } from '@/lib/data/positions'
 import type { TraderPortfolio } from '@/lib/data/positions'
 import { aggregateExcessSharpe } from '@/lib/utils/benchmark-sharpe'
+import { getBtcDailySeries, getSpyDailySeries, normalizeFromStart } from '@/lib/data/btc-daily'
 import { TraderEquityChart } from './TraderEquityChart'
 
 export const dynamic = 'force-dynamic'
@@ -47,6 +48,34 @@ function normalizeRow(r: Record<string, unknown>) {
     arena_score: num(r.arena_score),
     sharpe_ratio: num(r.sharpe_ratio),
     updated_at: String(r.updated_at ?? ''),
+  }
+}
+
+// Fetch BTC + SPY daily series sized to the longest window in the trader's
+// portfolio history. Used by the equity chart to overlay benchmark lines.
+async function fetchBenchmarkSeriesForHistory(
+  history: Awaited<ReturnType<typeof fetchHyperliquidPortfolioHistory>>,
+) {
+  if (!history) return { btc: null, spy: null }
+  // Find the largest window we'll display so we cache a single matching pull.
+  const longest = (history ?? []).reduce<{ days: number }>(
+    (acc, h) => {
+      const span = h.history.length > 1
+        ? (h.history[h.history.length - 1][0] - h.history[0][0]) / (1000 * 86400)
+        : 0
+      return span > acc.days ? { days: Math.ceil(span) } : acc
+    },
+    { days: 1 },
+  )
+  const days = Math.min(Math.max(longest.days, 7), 365)
+  try {
+    const [btc, spy] = await Promise.all([
+      getBtcDailySeries(days).catch(() => null),
+      getSpyDailySeries(days).catch(() => null),
+    ])
+    return { btc, spy }
+  } catch {
+    return { btc: null, spy: null }
   }
 }
 
@@ -182,7 +211,10 @@ export default async function TraderDetailPage({
       {portfolioHistory && portfolioHistory.length > 0 && (
         <section style={section}>
           <h2 style={h2}>Equity curve vs BTC vs S&amp;P</h2>
-          <TraderEquityChart history={portfolioHistory} />
+          <TraderEquityChart
+            history={portfolioHistory}
+            benchmarks={await fetchBenchmarkSeriesForHistory(portfolioHistory)}
+          />
         </section>
       )}
 

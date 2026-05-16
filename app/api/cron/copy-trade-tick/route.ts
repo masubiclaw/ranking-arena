@@ -36,6 +36,10 @@ import type { PositionChange } from '@/lib/data/positions/diff'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
+function round2(x: number): number {
+  return Math.round(x * 100) / 100
+}
+
 function selectExecutor(supabase: ReturnType<typeof getSupabaseAdmin>): TraderExecutor {
   const choice = (process.env.EXECUTOR ?? 'dry-run').toLowerCase()
   if (choice === 'hyperliquid') return new HyperliquidLiveExecutor()
@@ -155,6 +159,90 @@ export async function GET(request: NextRequest) {
 
   const executed: Array<Record<string, unknown>> = []
   let openCountRunning = openPositionCount
+  let pnlLogged = 0
+  let lossStreakNow = state.lossStreak
+  let cooldownUntilNow: string | null = state.cooldownUntil
+
+  // ── 1) Realized-PnL bookkeeping ─────────────────────────────────────────
+  // Walk close events first so the streak/cooldown is current before any
+  // new orders go out this tick. Only process events newer than what we
+  // already recorded — copy_state.last_event_at is the high-water mark.
+  const lastWatermark = state.lastEventAt ?? '1970-01-01T00:00:00Z'
+  const closeEvents = events.filter((e) =>
+    e.change_type === 'closed' &&
+    e.exit_price != null &&
+    e.prev_entry != null &&
+    e.prev_size != null &&
+    e.detected_at > lastWatermark
+  )
+  for (const ev of closeEvents) {
+    // Leader-side directional PnL per unit (USD per leader-base-size unit)
+    const dir = ev.prev_side === 'long' ? 1 : -1
+    const perUnit = (Number(ev.exit_price) - Number(ev.prev_entry)) * dir
+    // Scale to our follower notional: we copied `target_notional` (USD) at
+    // leader's entry, so our position size in leader-base units was
+    // target_notional / entry. Use the most recent matching dry_run_order.
+    const { data: orderRows } = await supabase
+      .from('dry_run_orders')
+      .select('target_notional_usd, side')
+      .eq('follower', followerLabel)
+      .eq('symbol', ev.symbol)
+      .eq('intent', 'open')
+      .order('submitted_at', { ascending: false })
+      .limit(1)
+    const intentRow = orderRows?.[0]
+    if (!intentRow) continue
+    const followerNotional = Number(intentRow.target_notional_usd)
+    const followerSize = followerNotional / Number(ev.prev_entry)
+    const pnl = round2(perUnit * followerSize)
+
+    await supabase.from('copy_realized_pnl').insert([{
+      follower: followerLabel,
+      leader_platform: ev.platform,
+      leader_key: ev.trader_key,
+      symbol: ev.symbol,
+      side: ev.prev_side,
+      notional_usd: followerNotional,
+      entry_price: Number(ev.prev_entry),
+      exit_price: Number(ev.exit_price),
+      pnl_usd: pnl,
+      closed_at: ev.detected_at,
+    }])
+    pnlLogged++
+
+    // Streak math: increment on loss, reset on gain.
+    if (pnl < 0) {
+      lossStreakNow++
+      if (lossStreakNow >= settings.lossStreakThreshold && settings.cooldownMinutesOnLosses > 0) {
+        cooldownUntilNow = new Date(Date.now() + settings.cooldownMinutesOnLosses * 60_000).toISOString()
+      }
+    } else if (pnl > 0) {
+      lossStreakNow = 0
+      cooldownUntilNow = null
+    }
+  }
+
+  // High-water mark = max detected_at across ALL events seen this tick
+  // (not just closed ones) — prevents re-seeing already-processed events.
+  const newWatermark = events.reduce(
+    (m, e) => (e.detected_at > m ? e.detected_at : m),
+    lastWatermark,
+  )
+
+  if (pnlLogged > 0 || lossStreakNow !== state.lossStreak || cooldownUntilNow !== state.cooldownUntil || newWatermark !== lastWatermark) {
+    await supabase.from('copy_state').upsert({
+      follower: followerLabel,
+      loss_streak: lossStreakNow,
+      cooldown_until: cooldownUntilNow,
+      last_event_at: newWatermark,
+      updated_at: new Date().toISOString(),
+    })
+    // refresh in-memory state so the guard below sees the new cooldown
+    state.lossStreak = lossStreakNow
+    state.cooldownUntil = cooldownUntilNow
+  }
+
+  // ── 2) Sizing + execution ──────────────────────────────────────────────
   for (const { ev, order } of intents) {
     if (!order) {
       executed.push({ skipped: true, reason: 'no order from sizing', event: ev.symbol })
@@ -177,6 +265,9 @@ export async function GET(request: NextRequest) {
     executor: executor.name,
     follower: followerLabel,
     leader_platform: leaderPlatform,
+    pnl_logged: pnlLogged,
+    loss_streak: lossStreakNow,
+    cooldown_until: cooldownUntilNow,
     settings: {
       capital_usd: settings.capitalUsd,
       max_notional_usd: settings.maxPositionNotionalUsd,

@@ -81,20 +81,43 @@ export async function GET(request: NextRequest) {
       const changes = diffPositions(prevPositions, portfolio.positions)
 
       if (changes.length > 0) {
-        const rows = changes.map((c) => ({
-          platform: t.platform,
-          trader_key: t.trader_key,
-          symbol: c.symbol,
-          change_type: c.changeType,
-          prev_side: c.prev?.side ?? null,
-          prev_size: c.prev?.size ?? null,
-          prev_entry: c.prev?.entryPrice ?? null,
-          new_side: c.next?.side ?? null,
-          new_size: c.next?.size ?? null,
-          new_entry: c.next?.entryPrice ?? null,
-          new_notional: c.next?.notionalUsd ?? null,
-          size_delta_pct: c.sizeDeltaPct,
-        }))
+        // For "closed" events the next-mark is gone from the portfolio.
+        // Fall back to the previous snapshot's last-seen mark price, then
+        // to entry. The realized-PnL ledger will use this as the exit
+        // price for both leader and follower books.
+        const prevByKey = new Map(prevRows?.map((r) => [r.symbol as string, r]) ?? [])
+        const rows = changes.map((c) => {
+          let exitPrice: number | null = null
+          if (c.changeType === 'closed') {
+            // Best exit-price proxy: the last mark price we saw before close.
+            // `trader_positions` row recorded notional_usd + size at the
+            // previous poll, so mark ≈ notional / size. Falls back to entry
+            // if that division is undefined.
+            const prev = prevByKey.get(c.symbol)
+            const prevSize = prev?.size != null ? Number(prev.size) : 0
+            const prevNotional = prev?.notional_usd != null ? Number(prev.notional_usd) : 0
+            if (prevSize > 0 && prevNotional > 0) {
+              exitPrice = prevNotional / prevSize
+            } else if (prev?.entry_price != null) {
+              exitPrice = Number(prev.entry_price)
+            }
+          }
+          return {
+            platform: t.platform,
+            trader_key: t.trader_key,
+            symbol: c.symbol,
+            change_type: c.changeType,
+            prev_side: c.prev?.side ?? null,
+            prev_size: c.prev?.size ?? null,
+            prev_entry: c.prev?.entryPrice ?? null,
+            new_side: c.next?.side ?? null,
+            new_size: c.next?.size ?? null,
+            new_entry: c.next?.entryPrice ?? null,
+            new_notional: c.next?.notionalUsd ?? null,
+            size_delta_pct: c.sizeDeltaPct,
+            exit_price: exitPrice,
+          }
+        })
         const { error: insErr } = await supabase.from('position_changes').insert(rows)
         if (insErr) {
           errors.push({ platform: t.platform, trader_key: t.trader_key, error: insErr.message })

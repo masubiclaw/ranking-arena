@@ -44,6 +44,38 @@ interface DryRunOrder {
   submitted_at: string
 }
 
+interface ReconEvent {
+  id: number
+  detected_at: string
+  follower: string
+  symbol: string
+  drift_type: 'orphan' | 'missing' | 'side_mismatch' | 'size_drift'
+  intent_side: string | null
+  intent_size: number | null
+  actual_side: string | null
+  actual_size: number | null
+  drift_pct: number | null
+  note: string | null
+}
+
+interface PnLRow {
+  id: number
+  closed_at: string
+  symbol: string
+  side: string
+  notional_usd: number
+  entry_price: number
+  exit_price: number
+  pnl_usd: number
+}
+
+interface CopyState {
+  follower: string
+  loss_streak: number
+  cooldown_until: string | null
+  last_event_at: string | null
+}
+
 async function fetchOverview() {
   const supabase = getSupabaseAdmin()
 
@@ -52,6 +84,9 @@ async function fetchOverview() {
     { data: changes },
     { data: orders },
     { data: positions },
+    { data: reconRaw },
+    { data: pnlRaw },
+    { data: stateRaw },
   ] = await Promise.all([
     supabase
       .from('tracked_traders')
@@ -71,6 +106,19 @@ async function fetchOverview() {
     supabase
       .from('trader_positions')
       .select('platform, trader_key, notional_usd'),
+    supabase
+      .from('reconciliation_events')
+      .select('*')
+      .order('detected_at', { ascending: false })
+      .limit(50),
+    supabase
+      .from('copy_realized_pnl')
+      .select('*')
+      .order('closed_at', { ascending: false })
+      .limit(50),
+    supabase
+      .from('copy_state')
+      .select('*'),
   ])
 
   const positionAggs = new Map<string, { count: number; notional: number }>()
@@ -90,11 +138,20 @@ async function fetchOverview() {
     }
   })
 
+  const pnlRows = (pnlRaw ?? []) as PnLRow[]
+  const totalPnL = pnlRows.reduce((s, r) => s + Number(r.pnl_usd), 0)
+  const winCount = pnlRows.filter((r) => Number(r.pnl_usd) > 0).length
+
   return {
     tracked,
     trackedCount: trackedCount ?? tracked.length,
     changes: (changes ?? []) as PositionChange[],
     orders: (orders ?? []) as DryRunOrder[],
+    reconciliation: (reconRaw ?? []) as ReconEvent[],
+    pnl: pnlRows,
+    state: ((stateRaw ?? []) as CopyState[])[0] ?? null,
+    totalPnL,
+    winRate: pnlRows.length > 0 ? winCount / pnlRows.length : null,
     executor: process.env.EXECUTOR ?? 'dry-run',
     followerCapital: Number(process.env.FOLLOWER_CAPITAL_USD ?? 1000),
     maxNotional: Number(process.env.COPY_MAX_NOTIONAL_USD ?? 250),
@@ -128,8 +185,17 @@ export default async function CopyMonitor() {
         <Stat label="Tracked traders" value={String(d.trackedCount)} />
         <Stat label="Events (24h)" value={String(eventCount24h)} />
         <Stat label="Orders (24h)" value={String(orderCount24h)} sub={d.executor === 'dry-run' ? 'dry-run only' : `live: ${d.executor}`} />
+        <Stat
+          label="Realized PnL"
+          value={`${d.totalPnL >= 0 ? '+' : ''}$${d.totalPnL.toFixed(2)}`}
+          sub={d.winRate != null ? `win rate ${(d.winRate * 100).toFixed(0)}% over ${d.pnl.length} closes` : 'no closes yet'}
+        />
+        <Stat
+          label="Loss streak"
+          value={String(d.state?.loss_streak ?? 0)}
+          sub={d.state?.cooldown_until ? `cooldown until ${new Date(d.state.cooldown_until).toLocaleTimeString()}` : 'no cooldown active'}
+        />
         <Stat label="Executor" value={d.executor} sub={`${d.maxLeverage}× max · $${d.maxNotional}/pos`} />
-        <Stat label="Follower capital" value={`$${d.followerCapital.toLocaleString()}`} />
       </section>
 
       <section style={section}>
@@ -223,6 +289,80 @@ export default async function CopyMonitor() {
       </section>
 
       <section style={section}>
+        <h2 style={h2}>Realized PnL (last 50 closes)</h2>
+        {d.pnl.length === 0 ? (
+          <EmptyState>No realized PnL yet. PnL is logged when a leader closes a position.</EmptyState>
+        ) : (
+          <table style={table}>
+            <thead>
+              <tr>
+                <th style={th}>When</th>
+                <th style={th}>Symbol</th>
+                <th style={th}>Side</th>
+                <th style={thRight}>Notional</th>
+                <th style={thRight}>Entry</th>
+                <th style={thRight}>Exit</th>
+                <th style={thRight}>PnL</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.pnl.map((r) => (
+                <tr key={r.id} style={tr}>
+                  <td style={{ ...td, color: '#9aa', fontSize: 12 }}>{relTime(r.closed_at)}</td>
+                  <td style={td}>{r.symbol}</td>
+                  <td style={{ ...td, color: r.side === 'long' ? '#7fd97f' : '#ff8888' }}>{r.side}</td>
+                  <td style={tdRight}>${Number(r.notional_usd).toFixed(2)}</td>
+                  <td style={tdRight}>${Number(r.entry_price).toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
+                  <td style={tdRight}>${Number(r.exit_price).toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
+                  <td style={{ ...tdRight, color: Number(r.pnl_usd) >= 0 ? '#7fd97f' : '#ff8888', fontWeight: 600 }}>
+                    {Number(r.pnl_usd) >= 0 ? '+' : ''}${Number(r.pnl_usd).toFixed(2)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section style={section}>
+        <h2 style={h2}>Reconciliation drifts (last 50)</h2>
+        {d.reconciliation.length === 0 ? (
+          <EmptyState>
+            No drift detected. Run <code style={code}>GET /api/cron/reconcile-positions</code> to check.
+          </EmptyState>
+        ) : (
+          <table style={table}>
+            <thead>
+              <tr>
+                <th style={th}>When</th>
+                <th style={th}>Symbol</th>
+                <th style={th}>Type</th>
+                <th style={thRight}>Intent size $</th>
+                <th style={thRight}>Actual size</th>
+                <th style={thRight}>Drift %</th>
+                <th style={th}>Note</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.reconciliation.map((r) => (
+                <tr key={r.id} style={tr}>
+                  <td style={{ ...td, color: '#9aa', fontSize: 12 }}>{relTime(r.detected_at)}</td>
+                  <td style={td}>{r.symbol}</td>
+                  <td style={{ ...td, color: driftColor(r.drift_type), fontWeight: 600 }}>{r.drift_type}</td>
+                  <td style={tdRight}>{r.intent_size != null ? `$${Number(r.intent_size).toFixed(0)}` : '—'}</td>
+                  <td style={tdRight}>{r.actual_size != null ? Number(r.actual_size).toLocaleString(undefined, { maximumFractionDigits: 4 }) : '—'}</td>
+                  <td style={{ ...tdRight, color: (r.drift_pct ?? 0) < 0 ? '#ff8888' : '#dccd7f' }}>
+                    {r.drift_pct != null ? `${r.drift_pct >= 0 ? '+' : ''}${r.drift_pct.toFixed(1)}%` : '—'}
+                  </td>
+                  <td style={{ ...td, color: '#9aa', fontSize: 12 }}>{r.note}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section style={section}>
         <h2 style={h2}>Dry-run orders (last 50)</h2>
         {d.orders.length === 0 ? (
           <EmptyState>No orders yet. Run <code style={code}>GET /api/cron/copy-trade-tick</code>.</EmptyState>
@@ -286,6 +426,15 @@ function typeColor(t: PositionChange['change_type']): string {
     case 'closed': return '#ff8888'
     case 'resized': return '#dccd7f'
     case 'flipped': return '#5e9eff'
+  }
+}
+
+function driftColor(t: ReconEvent['drift_type']): string {
+  switch (t) {
+    case 'orphan': return '#ff8888'
+    case 'missing': return '#dccd7f'
+    case 'side_mismatch': return '#ff5599'
+    case 'size_drift': return '#5e9eff'
   }
 }
 
