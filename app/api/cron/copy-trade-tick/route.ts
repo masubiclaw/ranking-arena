@@ -20,10 +20,10 @@ import { verifyCronSecret } from '@/lib/auth/verify-service-auth'
 import {
   proportionalSizing,
   DryRunExecutor,
-  HyperliquidExecutor,
   type TraderExecutor,
   type CopyContext,
 } from '@/lib/copy-trading/executor'
+import { HyperliquidLiveExecutor } from '@/lib/copy-trading/hyperliquid-executor'
 import {
   applyGuards,
   loadSettingsRow,
@@ -38,11 +38,9 @@ export const maxDuration = 60
 
 function selectExecutor(supabase: ReturnType<typeof getSupabaseAdmin>): TraderExecutor {
   const choice = (process.env.EXECUTOR ?? 'dry-run').toLowerCase()
-  if (choice === 'hyperliquid') return new HyperliquidExecutor()
+  if (choice === 'hyperliquid') return new HyperliquidLiveExecutor()
   return new DryRunExecutor(
-    supabase as unknown as Parameters<typeof DryRunExecutor.prototype.execute>[0] extends never
-      ? never
-      : ConstructorParameters<typeof DryRunExecutor>[0],
+    supabase as unknown as ConstructorParameters<typeof DryRunExecutor>[0],
     process.env.FOLLOWER_LABEL ?? 'local-bot',
   )
 }
