@@ -4,39 +4,61 @@
  * period returns); this one keeps the full series so the chart can sample
  * matching timestamps.
  *
- * Cached in-memory for 1 hour. Single-source for both BTC (CoinGecko
- * market_chart) and SPY (Yahoo Finance chart).
+ * DB-first: reads from daily_benchmark_prices (populated by the
+ * cache-benchmark-prices cron). Falls back to remote fetch on cold start or
+ * if the DB rows are stale (>25 h old), then caches in memory for 1 h.
  */
+
+import { getSupabaseAdmin } from '@/lib/supabase/server'
 
 type Series = { timestamps: number[]; values: number[] }
 type CachedSeries = Series & { fetchedAt: number }
 
 const CACHE_MS = 60 * 60 * 1000
+const STALE_HOURS = 25
 const cache = new Map<string, CachedSeries>()
 
-export async function getBtcDailySeries(days: number): Promise<Series> {
-  const key = `btc:${days}`
-  const cached = cache.get(key)
-  if (cached && Date.now() - cached.fetchedAt < CACHE_MS) return strip(cached)
+// ---------- DB helpers ----------
 
+async function fetchFromDb(asset: string, days: number): Promise<Series | null> {
+  try {
+    const supabase = getSupabaseAdmin()
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data, error } = await (supabase as any)
+      .from('daily_benchmark_prices')
+      .select('date, close_usd')
+      .eq('asset', asset)
+      .gte('date', since)
+      .order('date', { ascending: true })
+    if (error || !data || data.length < 2) return null
+    // Reject if the most-recent row is older than STALE_HOURS
+    const latest = new Date(data[data.length - 1].date).getTime()
+    if (Date.now() - latest > STALE_HOURS * 60 * 60 * 1000) return null
+    return {
+      timestamps: data.map((r: { date: string; close_usd: number }) => new Date(r.date).getTime()),
+      values: data.map((r: { date: string; close_usd: number }) => Number(r.close_usd)),
+    }
+  } catch {
+    return null
+  }
+}
+
+// ---------- Remote fetch helpers ----------
+
+async function fetchBtcRemote(days: number): Promise<Series> {
   const url = `https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=${days}&interval=daily`
   const res = await fetch(url, { headers: { accept: 'application/json' } })
   if (!res.ok) throw new Error(`CoinGecko BTC ${res.status}`)
   const j = (await res.json()) as { prices?: [number, number][] }
   const prices = j.prices ?? []
-  const series = {
+  return {
     timestamps: prices.map((p) => p[0]),
     values: prices.map((p) => p[1]),
   }
-  cache.set(key, { ...series, fetchedAt: Date.now() })
-  return series
 }
 
-export async function getSpyDailySeries(days: number): Promise<Series> {
-  const key = `spy:${days}`
-  const cached = cache.get(key)
-  if (cached && Date.now() - cached.fetchedAt < CACHE_MS) return strip(cached)
-
+async function fetchSpyRemote(days: number): Promise<Series> {
   const range = days <= 7 ? '1mo' : days <= 30 ? '3mo' : days <= 90 ? '6mo' : '1y'
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/SPY?range=${range}&interval=1d`
   const res = await fetch(url, { headers: { accept: 'application/json', 'user-agent': 'arena-ranking/1.0' } })
@@ -49,18 +71,49 @@ export async function getSpyDailySeries(days: number): Promise<Series> {
   }
   const t = j.chart?.result?.[0]?.timestamp ?? []
   const c = j.chart?.result?.[0]?.indicators?.adjclose?.[0]?.adjclose ?? []
-  const series = {
-    timestamps: [] as number[],
-    values: [] as number[],
-  }
+  const timestamps: number[] = []
+  const values: number[] = []
   for (let i = 0; i < t.length; i++) {
     if (typeof c[i] === 'number') {
-      series.timestamps.push(t[i] * 1000)  // SPY ts in seconds; normalize to ms
-      series.values.push(c[i] as number)
+      timestamps.push(t[i] * 1000) // SPY ts in seconds; normalize to ms
+      values.push(c[i] as number)
     }
   }
-  cache.set(key, { ...series, fetchedAt: Date.now() })
-  return series
+  return { timestamps, values }
+}
+
+// ---------- Public API ----------
+
+export async function getBtcDailySeries(days: number): Promise<Series> {
+  const key = `btc:${days}`
+  const cached = cache.get(key)
+  if (cached && Date.now() - cached.fetchedAt < CACHE_MS) return strip(cached)
+
+  const db = await fetchFromDb('BTC', days)
+  if (db) {
+    cache.set(key, { ...db, fetchedAt: Date.now() })
+    return db
+  }
+
+  const remote = await fetchBtcRemote(days)
+  cache.set(key, { ...remote, fetchedAt: Date.now() })
+  return remote
+}
+
+export async function getSpyDailySeries(days: number): Promise<Series> {
+  const key = `spy:${days}`
+  const cached = cache.get(key)
+  if (cached && Date.now() - cached.fetchedAt < CACHE_MS) return strip(cached)
+
+  const db = await fetchFromDb('SPY', days)
+  if (db) {
+    cache.set(key, { ...db, fetchedAt: Date.now() })
+    return db
+  }
+
+  const remote = await fetchSpyRemote(days)
+  cache.set(key, { ...remote, fetchedAt: Date.now() })
+  return remote
 }
 
 function strip(c: CachedSeries): Series {
@@ -73,7 +126,6 @@ function strip(c: CachedSeries): Series {
  * benchmarks on a trader's equity curve.
  */
 export function normalizeFromStart(series: Series, startTs: number): { timestamps: number[]; pct: number[] } {
-  // Find first index >= startTs
   let baseIdx = series.timestamps.findIndex((t) => t >= startTs)
   if (baseIdx < 0) baseIdx = 0
   const base = series.values[baseIdx]
