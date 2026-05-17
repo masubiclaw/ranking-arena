@@ -1,0 +1,199 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Ranking Arena v1 API",
+  "description": "JSON Schema contract for /api/v1/* endpoints consumed by ACP. Drift breaks CI via the per-route __tests__ that validate live responses against the matching $defs entry.",
+  "version": "1.1.0",
+  "auth": {
+    "scheme": "ARENA_API_AUTH_REQUIRED",
+    "headers": ["X-Arena-Api-Key", "Authorization: Bearer <key>"],
+    "envVars": ["ARENA_API_AUTH_REQUIRED", "ARENA_API_KEYS", "BOT_API_KEY"],
+    "notes": "When ARENA_API_AUTH_REQUIRED=true, every /api/v1/* request must present a valid key (either header). Valid keys come from ARENA_API_KEYS (comma-separated) or the legacy BOT_API_KEY. When ARENA_API_AUTH_REQUIRED is unset/false, requests pass through (dev/local). Per-key token bucket via ARENA_API_RATE_LIMIT_RPM (default 600/min)."
+  },
+  "rateLimit": {
+    "defaultRpm": 600,
+    "envVar": "ARENA_API_RATE_LIMIT_RPM",
+    "scope": "per (X-Arena-Api-Key OR Authorization Bearer key) when ARENA_API_AUTH_REQUIRED=true, else per client IP",
+    "exceeded": "429 with Retry-After + X-RateLimit-Limit headers"
+  },
+  "definitions": {
+    "Platform": {
+      "type": "string",
+      "enum": ["hyperliquid", "gmx", "dydx"]
+    },
+    "Direction": {
+      "type": "string",
+      "enum": ["long", "short"]
+    },
+    "Position": {
+      "type": "object",
+      "required": ["symbol", "raw_symbol", "direction", "captured_at"],
+      "properties": {
+        "symbol": { "type": "string", "description": "Canonical CCXT BASE/QUOTE (e.g. ETH/USDT, ETH/USD)." },
+        "raw_symbol": { "type": "string", "description": "Platform-native symbol as stored upstream." },
+        "direction": { "$ref": "#/definitions/Direction" },
+        "entry_price": { "type": ["number", "null"] },
+        "invested_pct": { "type": ["number", "null"], "description": "Percentage of the trader's portfolio invested in this position." },
+        "pnl": { "type": ["number", "null"] },
+        "captured_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "TraderPortfolio": {
+      "type": "object",
+      "required": ["platform", "trader_key", "positions", "last_captured_at", "fetched_at"],
+      "properties": {
+        "platform": { "$ref": "#/definitions/Platform" },
+        "trader_key": { "type": "string" },
+        "positions": { "type": "array", "items": { "$ref": "#/definitions/Position" } },
+        "last_captured_at": { "type": ["string", "null"], "format": "date-time", "description": "Most recent captured_at across positions." },
+        "fetched_at": { "type": "string", "format": "date-time", "description": "Server-side response timestamp." }
+      }
+    },
+    "BatchEntryOk": {
+      "type": "object",
+      "required": ["ok", "trader_key", "portfolio"],
+      "properties": {
+        "ok": { "type": "boolean", "const": true },
+        "trader_key": { "type": "string" },
+        "portfolio": { "$ref": "#/definitions/TraderPortfolio" }
+      }
+    },
+    "BatchEntryError": {
+      "type": "object",
+      "required": ["ok", "trader_key", "error"],
+      "properties": {
+        "ok": { "type": "boolean", "const": false },
+        "trader_key": { "type": "string" },
+        "error": { "type": "string", "description": "Stable error code, e.g. not_found, fetch_failed." }
+      }
+    },
+    "BatchResponse": {
+      "type": "object",
+      "required": ["platform", "fetched_at", "results"],
+      "properties": {
+        "platform": { "$ref": "#/definitions/Platform" },
+        "fetched_at": { "type": "string", "format": "date-time" },
+        "results": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "$ref": "#/definitions/BatchEntryOk" },
+              { "$ref": "#/definitions/BatchEntryError" }
+            ]
+          }
+        }
+      }
+    },
+    "ShrinkageBlock": {
+      "type": "object",
+      "required": ["mu_pop", "tau_sq", "eligible_n", "sf_threshold", "sf_fraction", "snapshot_date"],
+      "properties": {
+        "mu_pop": { "type": ["number", "null"] },
+        "tau_sq": { "type": ["number", "null"] },
+        "eligible_n": { "type": ["integer", "null"] },
+        "sf_threshold": { "type": ["number", "null"] },
+        "sf_fraction": { "type": ["number", "null"] },
+        "snapshot_date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
+      },
+      "additionalProperties": false
+    },
+    "TopTraderRow": {
+      "type": "object",
+      "required": ["platform", "trader_key", "observed", "shrunk", "posterior_sd", "weight_to_prior", "p_superforecaster"],
+      "properties": {
+        "platform": { "type": "string", "minLength": 1 },
+        "trader_key": { "type": "string", "minLength": 1 },
+        "observed": { "type": ["number", "null"] },
+        "shrunk": { "type": ["number", "null"] },
+        "posterior_sd": { "type": ["number", "null"] },
+        "weight_to_prior": { "type": ["number", "null"] },
+        "p_superforecaster": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "TopTradersResponse": {
+      "type": "object",
+      "required": ["shrinkage", "traders"],
+      "properties": {
+        "shrinkage": { "$ref": "#/definitions/ShrinkageBlock" },
+        "traders": { "type": "array", "items": { "$ref": "#/definitions/TopTraderRow" } }
+      },
+      "additionalProperties": false
+    },
+    "HealthResponse": {
+      "type": "object",
+      "required": ["status", "shrinkage_cron_last_run", "shrinkage_cron_age_seconds", "portfolio_upstream_status", "portfolio_upstream_last_seen", "version"],
+      "properties": {
+        "status": { "type": "string", "enum": ["ok", "degraded"] },
+        "shrinkage_cron_last_run": { "type": ["string", "null"], "format": "date-time" },
+        "shrinkage_cron_age_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "portfolio_upstream_status": { "type": "string", "enum": ["ok", "stale", "error"] },
+        "portfolio_upstream_last_seen": { "type": ["string", "null"], "format": "date-time" },
+        "version": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": { "type": "string" },
+        "detail": { "type": "string" }
+      }
+    }
+  },
+  "endpoints": {
+    "GET /api/v1/top-traders": {
+      "summary": "Empirical-Bayes shrinkage envelope of the top traders by P(SF).",
+      "queryParams": {
+        "criterion": { "required": false, "schema": { "type": "string", "enum": ["p_superforecaster"] } },
+        "window": { "required": false, "schema": { "type": "string", "enum": ["7D", "30D", "90D"] } },
+        "limit": { "required": false, "schema": { "type": "integer", "minimum": 1 } },
+        "platforms": { "required": false, "schema": { "type": "string", "description": "Comma-separated list of platforms." } },
+        "source": { "required": false, "schema": { "type": "string", "enum": ["snapshot", "live"] } },
+        "max_age_hours": { "required": false, "schema": { "type": "integer", "minimum": 1 } },
+        "snapshot_at": { "required": false, "schema": { "type": "string", "format": "date-time", "description": "When set, returns the closest snapshot at-or-before this timestamp. Returns 404 if none exists. Ignores source/max_age_hours." } }
+      },
+      "responses": {
+        "200": { "$ref": "#/definitions/TopTradersResponse" },
+        "400": { "$ref": "#/definitions/ErrorResponse" },
+        "401": { "$ref": "#/definitions/ErrorResponse" },
+        "404": { "$ref": "#/definitions/ErrorResponse" },
+        "429": { "$ref": "#/definitions/ErrorResponse" },
+        "503": { "$ref": "#/definitions/ErrorResponse" }
+      }
+    },
+    "GET /api/v1/health": {
+      "summary": "Kill-switch endpoint — ACP polls and refuses to trade when status=degraded.",
+      "responses": {
+        "200": { "$ref": "#/definitions/HealthResponse" },
+        "401": { "$ref": "#/definitions/ErrorResponse" },
+        "429": { "$ref": "#/definitions/ErrorResponse" }
+      }
+    },
+    "GET /api/v1/trader-portfolio": {
+      "summary": "Single trader's current open positions.",
+      "queryParams": {
+        "platform": { "required": true, "schema": { "$ref": "#/definitions/Platform" } },
+        "trader_key": { "required": true, "schema": { "type": "string" } }
+      },
+      "responses": {
+        "200": { "$ref": "#/definitions/TraderPortfolio" },
+        "400": { "$ref": "#/definitions/ErrorResponse" },
+        "401": { "$ref": "#/definitions/ErrorResponse" },
+        "404": { "$ref": "#/definitions/ErrorResponse" }
+      }
+    },
+    "GET /api/v1/trader-portfolios": {
+      "summary": "Batch (up to 50 keys, concurrency cap 8) — partial-result tolerant.",
+      "queryParams": {
+        "platform": { "required": true, "schema": { "$ref": "#/definitions/Platform" } },
+        "trader_keys": { "required": true, "schema": { "type": "string", "description": "Comma-separated trader keys, max 50 after dedup." } }
+      },
+      "responses": {
+        "200": { "$ref": "#/definitions/BatchResponse" },
+        "400": { "$ref": "#/definitions/ErrorResponse" },
+        "401": { "$ref": "#/definitions/ErrorResponse" }
+      }
+    }
+  }
+}

@@ -89,3 +89,27 @@ bitget_spot, mux, synthetix, paradex, kwenta, blofin, okx_spot, bitmart, whitebi
 |-----------|----------|
 | `lib/cron/fetchers/_deprecated/` | 39 old Inline Fetcher scripts |
 | `lib/connectors/_deprecated/` | 17 old BaseConnectorLegacy implementations |
+
+## Copy-trade v1 API (consumed by ACP)
+
+The `/api/v1/*` endpoints are the locked, versioned contract used by ACP's
+copy-trade bot. Schema: `docs/api/v1.json` (drift breaks CI via per-route tests).
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/v1/top-traders` | Empirical-Bayes shrinkage envelope. `source=snapshot` (default) reads `trader_shrinkage_snapshots`; `source=live` recomputes from `trader_snapshots_v2`; `snapshot_at=<iso8601>` time-travels to the closest historical row. |
+| `GET /api/v1/health` | Kill switch — `status: ok\|degraded`, `shrinkage_cron_last_run`, `portfolio_upstream_status`, `version`. ACP refuses to trade when degraded. |
+| `GET /api/top-traders` | **Deprecated.** 308 redirect to `/api/v1/top-traders`, kept for one release. |
+
+### Auth gate (`ARENA_API_AUTH_REQUIRED`)
+
+| `ARENA_API_AUTH_REQUIRED` | Behaviour |
+|---------------------------|-----------|
+| `true` | Every `/api/v1/*` request must present a valid API key in `X-Arena-Api-Key` or `Authorization: Bearer <key>`. Missing/invalid → `401`. |
+| unset / `false` | Pass-through (dev/local). |
+
+Valid keys come from `ARENA_API_KEYS` (comma-separated). `BOT_API_KEY` is accepted for backward compat. With the gate on but no keys configured, the server fails closed (`500 auth_misconfigured`).
+
+### Per-key rate limit (`ARENA_API_RATE_LIMIT_RPM`)
+
+In-process token bucket, default `600` requests/min/key, configurable via `ARENA_API_RATE_LIMIT_RPM`. Bucket scope is the API key when the gate is on, otherwise the client IP. Exceeding the budget returns `429` with `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers. No Redis dependency — multi-instance deployments get `N × limit` per key.
