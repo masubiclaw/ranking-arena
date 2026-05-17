@@ -121,13 +121,24 @@
     },
     "HealthResponse": {
       "type": "object",
-      "required": ["status", "shrinkage_cron_last_run", "shrinkage_cron_age_seconds", "portfolio_upstream_status", "portfolio_upstream_last_seen", "version"],
+      "required": [
+        "status",
+        "shrinkage_cron_last_run",
+        "shrinkage_cron_age_seconds",
+        "portfolio_upstream_status",
+        "portfolio_upstream_last_seen",
+        "portfolio_snapshot_cron_last_run",
+        "portfolio_snapshot_cron_age_seconds",
+        "version"
+      ],
       "properties": {
         "status": { "type": "string", "enum": ["ok", "degraded"] },
         "shrinkage_cron_last_run": { "type": ["string", "null"], "format": "date-time" },
         "shrinkage_cron_age_seconds": { "type": ["integer", "null"], "minimum": 0 },
         "portfolio_upstream_status": { "type": "string", "enum": ["ok", "stale", "error"] },
         "portfolio_upstream_last_seen": { "type": ["string", "null"], "format": "date-time" },
+        "portfolio_snapshot_cron_last_run": { "type": ["string", "null"], "format": "date-time", "description": "Newest captured_at across trader_portfolio_snapshots (CRYAA-2154)." },
+        "portfolio_snapshot_cron_age_seconds": { "type": ["integer", "null"], "minimum": 0, "description": "Seconds since the most recent portfolio-snapshot cron tick. Health flips degraded above 2h." },
         "version": { "type": "string", "minLength": 1 }
       },
       "additionalProperties": false
@@ -184,11 +195,13 @@
       }
     },
     "GET /api/v1/trader-portfolios": {
-      "summary": "Batch (up to 50 keys, concurrency cap 8) — partial-result tolerant.",
+      "summary": "Batch trader portfolios (up to 50 keys, concurrency cap 8) — partial-result tolerant. Consumed by ACP's copy-trade bot (live mode) and the weekly forward-validation script (snapshot_at replay, CRYAA-2154).",
       "queryParams": {
         "platform": { "required": true, "schema": { "$ref": "#/definitions/Platform" } },
-        "trader_keys": { "required": true, "schema": { "type": "string", "description": "Comma-separated trader keys, max 50 after dedup." } }
+        "trader_keys": { "required": true, "schema": { "type": "string", "description": "Comma-separated trader keys, max 50 after dedup." } },
+        "snapshot_at": { "required": false, "schema": { "type": "string", "format": "date-time", "description": "When set, returns the closest trader_portfolio_snapshots row at-or-before this timestamp per trader. Traders without a snapshot before the cutoff surface as ok=false, error='no_snapshot' (mirrors the batch error model)." } }
       },
+      "consumers": ["Asymmetric Crypto Printer (ACP) — live copy-trade reads + weekly forward-validation script"],
       "responses": {
         "200": { "$ref": "#/definitions/BatchResponse" },
         "400": { "$ref": "#/definitions/ErrorResponse" },

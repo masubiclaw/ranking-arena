@@ -47,6 +47,11 @@ jest.mock('@/lib/data/shrinkage-snapshots', () => ({
   newestComputedAt: (...args: unknown[]) => mockNewestComputedAt(...args),
 }))
 
+const mockNewestCapturedAt = jest.fn()
+jest.mock('@/lib/data/portfolio-snapshots', () => ({
+  newestCapturedAt: (...args: unknown[]) => mockNewestCapturedAt(...args),
+}))
+
 const mockSupabaseChain: Record<string, jest.Mock> = {}
 const mockGetSupabaseAdmin = jest.fn()
 jest.mock('@/lib/supabase/server', () => ({
@@ -87,11 +92,14 @@ beforeEach(() => {
 describe('GET /api/v1/health', () => {
   it('returns required keys', async () => {
     mockNewestComputedAt.mockResolvedValue(new Date().toISOString())
+    mockNewestCapturedAt.mockResolvedValue(new Date().toISOString())
     stubSupabasePortfolio(new Date().toISOString())
     const res = await GET(makeReq())
     const body = (await res.json()) as Record<string, unknown>
     expect(Object.keys(body).sort()).toEqual(
       [
+        'portfolio_snapshot_cron_age_seconds',
+        'portfolio_snapshot_cron_last_run',
         'portfolio_upstream_last_seen',
         'portfolio_upstream_status',
         'shrinkage_cron_age_seconds',
@@ -102,8 +110,9 @@ describe('GET /api/v1/health', () => {
     )
   })
 
-  it('status=ok when both freshness checks pass', async () => {
+  it('status=ok when all three freshness checks pass', async () => {
     mockNewestComputedAt.mockResolvedValue(new Date().toISOString())
+    mockNewestCapturedAt.mockResolvedValue(new Date().toISOString())
     stubSupabasePortfolio(new Date().toISOString())
     const res = await GET(makeReq())
     const body = (await res.json()) as { status: string }
@@ -114,6 +123,7 @@ describe('GET /api/v1/health', () => {
     // 3h old > 2h threshold
     const stale = new Date(Date.now() - 3 * 3600 * 1000).toISOString()
     mockNewestComputedAt.mockResolvedValue(stale)
+    mockNewestCapturedAt.mockResolvedValue(new Date().toISOString())
     stubSupabasePortfolio(new Date().toISOString())
     const res = await GET(makeReq())
     const body = (await res.json()) as { status: string; shrinkage_cron_age_seconds: number }
@@ -123,6 +133,7 @@ describe('GET /api/v1/health', () => {
 
   it('status=degraded when portfolio upstream errors', async () => {
     mockNewestComputedAt.mockResolvedValue(new Date().toISOString())
+    mockNewestCapturedAt.mockResolvedValue(new Date().toISOString())
     stubSupabasePortfolio(null, { message: 'pg connection lost' })
     const res = await GET(makeReq())
     const body = (await res.json()) as { status: string; portfolio_upstream_status: string }
@@ -132,12 +143,40 @@ describe('GET /api/v1/health', () => {
 
   it('status=degraded when portfolio upstream is stale', async () => {
     mockNewestComputedAt.mockResolvedValue(new Date().toISOString())
+    mockNewestCapturedAt.mockResolvedValue(new Date().toISOString())
     // 30 min ago > 15 min threshold
     stubSupabasePortfolio(new Date(Date.now() - 30 * 60 * 1000).toISOString())
     const res = await GET(makeReq())
     const body = (await res.json()) as { status: string; portfolio_upstream_status: string }
     expect(body.status).toBe('degraded')
     expect(body.portfolio_upstream_status).toBe('stale')
+  })
+
+  it('status=degraded when portfolio-snapshot cron is stale', async () => {
+    mockNewestComputedAt.mockResolvedValue(new Date().toISOString())
+    // 3h old > 2h threshold
+    mockNewestCapturedAt.mockResolvedValue(new Date(Date.now() - 3 * 3600 * 1000).toISOString())
+    stubSupabasePortfolio(new Date().toISOString())
+    const res = await GET(makeReq())
+    const body = (await res.json()) as {
+      status: string
+      portfolio_snapshot_cron_age_seconds: number
+    }
+    expect(body.status).toBe('degraded')
+    expect(body.portfolio_snapshot_cron_age_seconds).toBeGreaterThan(2 * 3600)
+  })
+
+  it('status=degraded when portfolio-snapshot table is empty', async () => {
+    mockNewestComputedAt.mockResolvedValue(new Date().toISOString())
+    mockNewestCapturedAt.mockResolvedValue(null)
+    stubSupabasePortfolio(new Date().toISOString())
+    const res = await GET(makeReq())
+    const body = (await res.json()) as {
+      status: string
+      portfolio_snapshot_cron_last_run: string | null
+    }
+    expect(body.status).toBe('degraded')
+    expect(body.portfolio_snapshot_cron_last_run).toBeNull()
   })
 
   it('401 when auth required and no key', async () => {
@@ -149,6 +188,7 @@ describe('GET /api/v1/health', () => {
 
   it('response validates against HealthResponse schema', async () => {
     mockNewestComputedAt.mockResolvedValue(new Date().toISOString())
+    mockNewestCapturedAt.mockResolvedValue(new Date().toISOString())
     stubSupabasePortfolio(new Date().toISOString())
     const res = await GET(makeReq())
     const body = await res.json()

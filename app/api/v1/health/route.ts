@@ -1,19 +1,22 @@
 /**
  * GET /api/v1/health — kill-switch endpoint polled by ACP's `arena_client.health`.
  *
- * Returns JSON describing the freshness of the two pieces ACP depends on:
+ * Returns JSON describing the freshness of the three pieces ACP depends on:
  *   - the shrinkage cron (newest `trader_shrinkage_snapshots.computed_at`)
  *   - the portfolio upstream (most recent `trader_snapshots_v2.as_of_ts` is
  *     used as a proxy for "the data pipeline is still pumping")
+ *   - the portfolio-snapshot cron (newest `trader_portfolio_snapshots.captured_at`),
+ *     surfaced for ACP's weekly forward-validation script (CRYAA-2154).
  *
- * Top-level `status` is `degraded` when either of the two age thresholds
- * tripped, otherwise `ok`. Gate: same `requireArenaAuth` + token bucket as the
+ * Top-level `status` is `degraded` when any of the three age thresholds
+ * trip, otherwise `ok`. Gate: same `requireArenaAuth` + token bucket as the
  * other v1 routes so health probes count against the caller's budget — that
  * stops a misbehaving consumer from looping `/health` to evade rate limiting.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
 import { newestComputedAt } from '@/lib/data/shrinkage-snapshots'
+import { newestCapturedAt } from '@/lib/data/portfolio-snapshots'
 import { getSupabaseAdmin } from '@/lib/supabase/server'
 import { logger } from '@/lib/logger'
 import { gate } from '../_gate'
@@ -26,6 +29,9 @@ const SHRINKAGE_MAX_AGE_SECONDS = 2 * 3600
 // Portfolio upstream is polled every ~5 min by the data pipeline; 15 min of
 // staleness is the threshold beyond which ACP should stop trusting positions.
 const PORTFOLIO_MAX_AGE_SECONDS = 15 * 60
+// Portfolio-snapshot cron runs hourly per CRYAA-2154; 2h grace mirrors the
+// shrinkage threshold so a single missed fire does not flip the kill switch.
+const PORTFOLIO_SNAPSHOT_MAX_AGE_SECONDS = 2 * 3600
 
 const PORTFOLIO_HEALTH_WINDOW: '90D' | '7D' = '90D'
 
@@ -37,6 +43,8 @@ interface HealthResponse {
   shrinkage_cron_age_seconds: number | null
   portfolio_upstream_status: UpstreamStatus
   portfolio_upstream_last_seen: string | null
+  portfolio_snapshot_cron_last_run: string | null
+  portfolio_snapshot_cron_age_seconds: number | null
   version: string
 }
 
@@ -88,19 +96,43 @@ async function shrinkageFreshness(): Promise<{ lastRun: string | null; ageSecond
   }
 }
 
+async function portfolioSnapshotFreshness(): Promise<{
+  lastRun: string | null
+  ageSeconds: number | null
+}> {
+  try {
+    const lastRun = await newestCapturedAt()
+    if (!lastRun) return { lastRun: null, ageSeconds: null }
+    const ageMs = Date.now() - new Date(lastRun).getTime()
+    if (Number.isNaN(ageMs)) return { lastRun, ageSeconds: null }
+    return { lastRun, ageSeconds: Math.max(0, Math.floor(ageMs / 1000)) }
+  } catch (err) {
+    logger.warn(
+      '[/api/v1/health] portfolio-snapshot freshness check failed:',
+      err instanceof Error ? err.message : String(err)
+    )
+    return { lastRun: null, ageSeconds: null }
+  }
+}
+
 export async function GET(request: NextRequest) {
   const pass = gate(request)
   if (!pass.ok) return pass.response
 
-  const [shrink, portfolio] = await Promise.all([
+  const [shrink, portfolio, portfolioSnapshot] = await Promise.all([
     shrinkageFreshness(),
     portfolioFreshness(),
+    portfolioSnapshotFreshness(),
   ])
 
   const shrinkOk =
     shrink.ageSeconds !== null && shrink.ageSeconds <= SHRINKAGE_MAX_AGE_SECONDS
   const portfolioOk = portfolio.status === 'ok'
-  const status: HealthResponse['status'] = shrinkOk && portfolioOk ? 'ok' : 'degraded'
+  const portfolioSnapshotOk =
+    portfolioSnapshot.ageSeconds !== null &&
+    portfolioSnapshot.ageSeconds <= PORTFOLIO_SNAPSHOT_MAX_AGE_SECONDS
+  const status: HealthResponse['status'] =
+    shrinkOk && portfolioOk && portfolioSnapshotOk ? 'ok' : 'degraded'
 
   const body: HealthResponse = {
     status,
@@ -108,6 +140,8 @@ export async function GET(request: NextRequest) {
     shrinkage_cron_age_seconds: shrink.ageSeconds,
     portfolio_upstream_status: portfolio.status,
     portfolio_upstream_last_seen: portfolio.lastSeen,
+    portfolio_snapshot_cron_last_run: portfolioSnapshot.lastRun,
+    portfolio_snapshot_cron_age_seconds: portfolioSnapshot.ageSeconds,
     version: buildVersion(),
   }
 
@@ -117,4 +151,9 @@ export async function GET(request: NextRequest) {
   return response
 }
 
-export const __test = { PORTFOLIO_MAX_AGE_SECONDS, SHRINKAGE_MAX_AGE_SECONDS, buildVersion }
+export const __test = {
+  PORTFOLIO_MAX_AGE_SECONDS,
+  SHRINKAGE_MAX_AGE_SECONDS,
+  PORTFOLIO_SNAPSHOT_MAX_AGE_SECONDS,
+  buildVersion,
+}
