@@ -27,7 +27,13 @@ import {
   type ShrinkageWindow,
   type TraderShrinkageSnapshot,
 } from '@/lib/data/shrinkage-snapshots'
+import {
+  defaultActiveSince,
+  fetchEligibleArenaPool,
+} from '@/lib/data/arena-eligible-pool'
+import { getBtcBenchmark } from '@/lib/data/btc-returns'
 import { getSupabaseAdmin } from '@/lib/supabase/server'
+import { aggregateExcessSharpe } from '@/lib/utils/benchmark-sharpe'
 import {
   estimatePopulation,
   posteriorProbAbove,
@@ -177,13 +183,7 @@ async function readSnapshot(
   return buildEnvelope(rows, limit)
 }
 
-interface V2Row {
-  platform: string
-  trader_key: string
-  sharpe_ratio: number | null
-  trades_count: number | null
-  as_of_ts: string
-}
+const PERIOD_DAYS: Record<ShrinkageWindow, number> = { '7D': 7, '30D': 30, '90D': 90 }
 
 async function readLive(
   window: ShrinkageWindow,
@@ -191,42 +191,61 @@ async function readLive(
   limit: number,
 ): Promise<Envelope | 'empty'> {
   const supabase = getSupabaseAdmin()
-  let q = supabase
-    .from('trader_snapshots_v2')
-    .select('platform, trader_key, sharpe_ratio, trades_count, as_of_ts')
-    .eq('window', window)
-    .not('sharpe_ratio', 'is', null)
-    .order('as_of_ts', { ascending: false })
 
-  if (platforms && platforms.length > 0) q = q.in('platform', platforms)
+  // Single source of truth for the eligible pool. Same predicate as the
+  // /superforecasters page and (when built) the D1 shrinkage cron.
+  const eligible = await fetchEligibleArenaPool(supabase, {
+    window,
+    minUpdatedAt: defaultActiveSince(),
+    platforms,
+  })
 
-  const { data, error } = await q
-  if (error) throw new Error(`live recompute failed: ${error.message}`)
+  if (eligible.length === 0) return 'empty'
 
-  const rows = (data ?? []) as V2Row[]
-  if (rows.length === 0) return 'empty'
-
-  const seen = new Set<string>()
-  const latest: V2Row[] = []
-  for (const r of rows) {
-    const key = `${r.platform}\x00${r.trader_key}`
-    if (seen.has(key)) continue
-    seen.add(key)
-    latest.push(r)
+  let btcReturn = 0
+  try {
+    const snap = await getBtcBenchmark(window)
+    btcReturn = snap.periodReturnPct
+  } catch {
+    /* fall through with 0 */
   }
 
-  const inputs: ShrinkageInput[] = latest.map(r => ({
-    observed: r.sharpe_ratio as number,
-    tradesCount: r.trades_count ?? null,
+  // Compute sharpe_vs_btc per row (matches /superforecasters semantics).
+  // Rows where roi_pct is null or aggregateExcessSharpe returns null are
+  // dropped here. The predicate already guarantees a credible drawdown.
+  const enriched = eligible
+    .map((r) => {
+      const svb = r.roi_pct != null
+        ? aggregateExcessSharpe(r.roi_pct, btcReturn, r.max_drawdown, PERIOD_DAYS[window])
+        : null
+      if (svb == null) return null
+      return { row: r, svb }
+    })
+    .filter((x): x is NonNullable<typeof x> => x != null)
+
+  if (enriched.length === 0) return 'empty'
+
+  const inputs: ShrinkageInput[] = enriched.map((e) => ({
+    observed: e.svb,
+    tradesCount: e.row.trades_count ?? null,
   }))
   const pop = estimatePopulation(inputs)
   if (!pop) return 'empty'
 
-  // First pass: posterior mean/sd per trader.
-  const partials = latest.map((r, i) => {
-    const result = shrinkOne(inputs[i], pop)
-    return { row: r, result }
+  // Observability: log pool size and μ_pop at scan time so we can compare
+  // before/after the predicate change (CRYAA-2118 acceptance #6).
+  logger.info('[/api/v1/top-traders] live scan', {
+    window,
+    eligible_n: pop.n,
+    mu_pop: pop.muPop,
+    tau_sq: pop.tauSq,
   })
+
+  // First pass: posterior mean/sd per trader.
+  const partials = enriched.map((e, i) => ({
+    row: e.row,
+    result: shrinkOne(inputs[i], pop),
+  }))
 
   // Second pass: derive the SF threshold from the full shrunk distribution and
   // compute pSuperforecaster relative to it. `sf_fraction` is fixed at 0.05

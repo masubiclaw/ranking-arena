@@ -1,7 +1,12 @@
 import { SuperforecasterTable } from './SuperforecasterTable'
 import { getSupabaseAdmin } from '@/lib/api'
 import { getBtcBenchmark } from '@/lib/data/btc-returns'
+import {
+  defaultActiveSince,
+  fetchEligibleArenaPool,
+} from '@/lib/data/arena-eligible-pool'
 import { aggregateExcessSharpe } from '@/lib/utils/benchmark-sharpe'
+import { logger } from '@/lib/logger'
 import {
   estimatePopulation,
   shrinkOne,
@@ -28,27 +33,13 @@ function num(v: unknown): number | null {
 
 async function fetchWindow(windowParam: Window) {
   const supabase = getSupabaseAdmin()
-  const { data } = await supabase
-    .from('trader_snapshots_v2')
-    .select(
-      'platform, trader_key, roi_pct, pnl_usd, max_drawdown, trades_count, arena_score, sharpe_ratio, updated_at',
-    )
-    .eq('window', windowParam)
-    .gte('updated_at', new Date(Date.now() - 24 * 3600 * 1000).toISOString())
-    .not('max_drawdown', 'is', null)
-    .order('updated_at', { ascending: false })
-    .limit(10000)
-
-  const rawRows = data ?? []
-
-  // Dedupe to latest snapshot per (platform, trader_key). The partition table
-  // can hold multiple rows for the same trader from earlier refresh cycles.
-  const latestByKey = new Map<string, typeof rawRows[number]>()
-  for (const r of rawRows) {
-    const k = `${r.platform}:${r.trader_key}`
-    if (!latestByKey.has(k)) latestByKey.set(k, r)
-  }
-  const rows = Array.from(latestByKey.values())
+  // Centralized eligibility predicate: active + trades_count >= 30 +
+  // |max_drawdown| >= 0.5. Same helper as /api/v1/top-traders live and
+  // (when built) the D1 shrinkage cron — see CRYAA-2118.
+  const rows = await fetchEligibleArenaPool(supabase, {
+    window: windowParam,
+    minUpdatedAt: defaultActiveSince(),
+  })
 
   let btcReturn = 0
   try {
@@ -78,6 +69,15 @@ async function fetchWindow(windowParam: Window) {
   const popParams = estimatePopulation(
     enriched.map((e) => ({ observed: e.sharpe_vs_btc, tradesCount: e.trades_count })),
   )
+
+  if (popParams) {
+    logger.info('[superforecasters] live scan', {
+      window: windowParam,
+      eligible_n: popParams.n,
+      mu_pop: popParams.muPop,
+      tau_sq: popParams.tauSq,
+    })
+  }
 
   const allEnriched = enriched.map((e) => {
     if (!popParams) {

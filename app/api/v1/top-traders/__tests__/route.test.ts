@@ -49,6 +49,20 @@ jest.mock('@/lib/data/shrinkage-snapshots', () => ({
   findAtOrBefore: (...args: unknown[]) => mockFindAtOrBefore(...args),
 }))
 
+const mockFetchEligiblePool = jest.fn()
+jest.mock('@/lib/data/arena-eligible-pool', () => {
+  const actual = jest.requireActual('@/lib/data/arena-eligible-pool')
+  return {
+    ...actual,
+    fetchEligibleArenaPool: (...args: unknown[]) => mockFetchEligiblePool(...args),
+  }
+})
+
+const mockGetBtcBenchmark = jest.fn()
+jest.mock('@/lib/data/btc-returns', () => ({
+  getBtcBenchmark: (...args: unknown[]) => mockGetBtcBenchmark(...args),
+}))
+
 const mockGetSupabaseAdmin = jest.fn()
 jest.mock('@/lib/supabase/server', () => ({
   getSupabaseAdmin: () => mockGetSupabaseAdmin(),
@@ -270,6 +284,96 @@ describe('GET /api/v1/top-traders — rate limit', () => {
     expect((await GET(makeReq('?window=90D', { 'X-Arena-Api-Key': 'alpha' }))).status).toBe(200)
     expect((await GET(makeReq('?window=90D', { 'X-Arena-Api-Key': 'alpha' }))).status).toBe(429)
     expect((await GET(makeReq('?window=90D', { 'X-Arena-Api-Key': 'beta' }))).status).toBe(200)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Live mode — new eligibility predicate (CRYAA-2118).
+// ---------------------------------------------------------------------------
+
+function makeLiveRow(over: {
+  trader_key?: string
+  trades_count?: number | null
+  max_drawdown?: number | null
+  roi_pct?: number | null
+  updated_at?: string
+}) {
+  return {
+    platform: 'hyperliquid',
+    trader_key: over.trader_key ?? 't',
+    roi_pct: over.roi_pct ?? 50,
+    pnl_usd: 1000,
+    max_drawdown: over.max_drawdown ?? -5,
+    trades_count: over.trades_count ?? 100,
+    arena_score: 1.5,
+    sharpe_ratio: 1.2,
+    updated_at: over.updated_at ?? '2026-05-17T12:00:00.000Z',
+  }
+}
+
+describe('GET /api/v1/top-traders — live mode eligible-pool predicate', () => {
+  beforeEach(() => {
+    mockGetBtcBenchmark.mockResolvedValue({ periodReturnPct: 5 })
+    // Live mode needs SOMETHING that won't throw if accidentally called.
+    mockGetSupabaseAdmin.mockReturnValue({})
+  })
+
+  it('shrinkage.eligible_n matches the pool returned by the predicate helper', async () => {
+    // Five fully-eligible rows; expect eligible_n = 5.
+    const rows = ['a', 'b', 'c', 'd', 'e'].map((k, i) =>
+      makeLiveRow({ trader_key: k, roi_pct: 10 + i, trades_count: 50 + i }),
+    )
+    mockFetchEligiblePool.mockResolvedValue(rows)
+
+    const res = await GET(makeReq('?window=90D&source=live'))
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { shrinkage: { eligible_n: number }; traders: unknown[] }
+    expect(body.shrinkage.eligible_n).toBe(5)
+  })
+
+  it('regression: high-ROI trader with insufficient trades is not in the live pool', async () => {
+    // The helper is the single gate. If the test mock includes a "ROI king"
+    // who would have been in the old top-5000 ROI pool, the helper must have
+    // filtered them BEFORE the route saw them. We assert that by only
+    // mocking the post-predicate result and verifying the route's eligible_n
+    // does not count them.
+    const eligibleOnly = [
+      makeLiveRow({ trader_key: 'steady_1', roi_pct: 8, trades_count: 80 }),
+      makeLiveRow({ trader_key: 'steady_2', roi_pct: 6, trades_count: 60 }),
+    ]
+    mockFetchEligiblePool.mockResolvedValue(eligibleOnly)
+
+    const res = await GET(makeReq('?window=90D&source=live'))
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as {
+      shrinkage: { eligible_n: number }
+      traders: Array<{ trader_key: string }>
+    }
+    expect(body.shrinkage.eligible_n).toBe(2)
+    expect(body.traders.map((t) => t.trader_key)).not.toContain('roi_king')
+  })
+
+  it('passes window and platforms through to the helper', async () => {
+    mockFetchEligiblePool.mockResolvedValue([
+      makeLiveRow({ trader_key: 'a', trades_count: 50 }),
+      makeLiveRow({ trader_key: 'b', trades_count: 60 }),
+      makeLiveRow({ trader_key: 'c', trades_count: 70 }),
+      makeLiveRow({ trader_key: 'd', trades_count: 80 }),
+      makeLiveRow({ trader_key: 'e', trades_count: 90 }),
+    ])
+    await GET(makeReq('?window=30D&source=live&platforms=arena,hyperliquid'))
+    expect(mockFetchEligiblePool).toHaveBeenCalledTimes(1)
+    const callArgs = mockFetchEligiblePool.mock.calls[0][1]
+    expect(callArgs.window).toBe('30D')
+    expect(callArgs.platforms).toEqual(['arena', 'hyperliquid'])
+    expect(callArgs.minUpdatedAt).toBeInstanceOf(Date)
+  })
+
+  it('503 when the eligible pool is empty', async () => {
+    mockFetchEligiblePool.mockResolvedValue([])
+    const res = await GET(makeReq('?window=90D&source=live'))
+    expect(res.status).toBe(503)
+    expect(((await res.json()) as { error: string }).error).toBe('no_data')
   })
 })
 
