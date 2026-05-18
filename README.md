@@ -443,6 +443,25 @@ npm run test           # Jest test suite (139 suites, 2,271 tests)
 npm run test:e2e       # Playwright E2E tests
 ```
 
+#### Troubleshooting: Jest reports `<rootDir>/jest.setup.js` not found
+
+Jest 30 resolves modules via `unrs-resolver`, which loads a native binding at `node_modules/@unrs/resolver-binding-darwin-arm64/resolver.darwin-arm64.node` (or the equivalent for your platform). If that `.node` file is truncated/corrupt, `dlopen` fails and `jest-resolve`'s `findNodeModule` silently returns `null` for **every** path — including absolute, file-existing ones like `jest.setup.js`. The user-visible symptom is a misleading "Module not found" validation error.
+
+Diagnose:
+
+```bash
+node -e "require('unrs-resolver')"   # surfaces the real dlopen error
+```
+
+Fix:
+
+```bash
+rm -rf node_modules/@unrs/resolver-binding-darwin-arm64
+npm install
+```
+
+A healthy `resolver.darwin-arm64.node` is ~1.7 MB. A truncated one (e.g. ~440 KB) is the corrupted file.
+
 ### Diagnostic Scripts
 
 ```bash
